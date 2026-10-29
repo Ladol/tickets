@@ -22,6 +22,9 @@ API_TIMEOUT = (10, 30)
 SEAT_LOCK_DURATION = timedelta(minutes=15)
 # Stop retrying this long before the lock is due to expire (also absorbs the latency of the create-sale call).
 SEAT_LOCK_MARGIN = timedelta(seconds=60)
+# Checkout only works from the 24h unlock mark on, so the lock must outlive it by at least this much
+# (time for the checkout requests and their retries). With a 15-min lock this allows locking from unlock - 11 min.
+MIN_CHECKOUT_WINDOW = timedelta(minutes=3)
 
 # statusCode values in the train-seats map (1 = taken, 3 = blocked, e.g. wheelchair spaces)
 SEAT_FREE = 0
@@ -647,11 +650,14 @@ class Booking:
         """Runs the whole booking and returns the ticket link (or a pointer to the CP app)."""
         await self.notify(f"🚂 Starting automated booking for Train **{self.train_num}** on **{self.train_date}**...")
 
-        if self.mode == "scheduled" and self.unlock_at - _now() > timedelta(minutes=7):
-            # Locking now would let the 15-minute hold expire before checkout is possible.
-            lock_at = self.unlock_at - timedelta(minutes=5)
-            await self.notify(f"⏳ Trigger fired early; waiting until {lock_at:%H:%M:%S} to lock the seat so the hold lasts past the unlock mark...")
-            await self._sleep((lock_at - _now()).total_seconds())
+        # Locking too early would let the 15-minute hold expire before checkout has had time to go through.
+        earliest_lock = self.unlock_at + MIN_CHECKOUT_WINDOW + SEAT_LOCK_MARGIN - SEAT_LOCK_DURATION
+        if self.mode == "scheduled" and _now() < earliest_lock:
+            await self.notify(
+                f"⏳ Trigger fired early; waiting until {earliest_lock:%H:%M:%S} to lock the seat, so the "
+                f"15-minute hold still leaves {int(MIN_CHECKOUT_WINDOW.total_seconds() // 60)} min for checkout after the unlock mark..."
+            )
+            await self._sleep((earliest_lock - _now()).total_seconds())
 
         # Before unlock, keep retrying until a few minutes past it; for watch probes, give up fast.
         setup_until = max(_now(), self.unlock_at) + timedelta(minutes=5 if self.mode == "scheduled" else 1)
